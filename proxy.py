@@ -7,8 +7,43 @@ from argparse import ArgumentParser
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum, Enum
-from tkinter import Pack
 from typing import Callable, List, Any
+
+
+"""
+EXAMPLE PACKET
+
+# packet type
+\x00\x06
+# object name
+\x00\x00\x00\x16
+\x00L\x00L\x00A\x00c\x00c\x00e\x00s\x00s\x00I\x00p\x00c
+# call type
+\x00\x00\x00\x00
+# method index
+\x00\x00\x00\x0c
+# arg list size
+\x00\x00\x00\x03
+# first arg
+\x00\x00\x04\x00 # type id (user)
+\x00 # is_null
+\x00\x00\x00\x1a # custom type name len
+ll_access::DramIdentifier\x00 # custom type name
+\x00\x00\x00\x00\x00\x00\x00\x00Z
+
+# second arg
+\x00\x00\x00$ # ushort
+\x00 # is null
+\x00E # short int value
+
+# third arg
+\x00\x00\x00\x02 # type int
+\x00 # is null
+\xff\xff\xff\xfe # int value
+
+\x00\x00\x00\x0b # packet serial id
+\xff\xff\xff\xff # packet property index
+"""
 
 
 URI_MAPPING_SIZE = 64
@@ -41,6 +76,7 @@ class PacketParser:
         self.data = self.data[size:]
 
     def read_bytes(self, size):
+        assert len(self.data) >= size
         res = self.data[:size]
         self.skip(size)
         return res
@@ -73,13 +109,13 @@ class PacketParser:
                 res.append(data[i * 2 + 1])
                 res.append(data[i * 2])
             data = res
-        return data.decode("utf-16")
+        return bytes(data).decode("utf-16")
 
     def read_utf8(self, header_size=4, byteorder=None):
         byteorder = self.get_byteorder(byteorder)
         size = self.read_uint(header_size, byteorder=byteorder)
         data = self.read_bytes(size)
-        return data.decode("utf-8")
+        return bytes(data).decode("utf-8")
 
 
 def open_shmem(name, size, writable=False, create=False):
@@ -189,22 +225,41 @@ async def service(*args):
     await proc.wait()
 
 
-# https://github.com/qt/qtbase/blob/dev/src/corelib/kernel/qvariant.h
+# https://github.com/qt/qtbase/blob/dev/src/corelib/kernel/qmetatype.h
 class VariantType(IntEnum):
-    Invalid = 0,
-    Bool = 1,
-    Int = 2,
-    UInt = 3,
-    LongLong = 4,
-    ULongLong = 5,
-    Double = 6,
-    Char = 7,
-    Map = 8,
-    List = 9,
-    String = 10,
-    StringList = 11,
-    ByteArray = 12,
-    UserType = 1024,
+    Invalid = 0
+    Bool = 1
+    Int = 2
+    UInt = 3
+    LongLong = 4
+    ULongLong = 5
+    Double = 6
+    Char = 7
+    Map = 8
+    List = 9
+    String = 10
+    StringList = 11
+    ByteArray = 12
+    UShort = 36
+    UChar = 37
+    UserType = 1024
+
+def deserialize_usertype(parser: PacketParser):
+    typename = parser.read_utf8().rstrip("\0")
+    if typename == "ll_access::DramIdentifier":
+        unknown_flag = parser.read_bool()
+        ram_id = parser.read_uint(8)
+        return (unknown_flag, ram_id)
+    if typename == "QVector<QPair<ushort,uchar> >":
+        vector_size = parser.read_uint(4)
+        vector = []
+        for _ in range(vector_size):
+            addr = parser.read_uint(2)
+            value = parser.read_uint(1)
+            vector.append((addr, value))
+        return vector
+    return f"missing handler for {typename}"
+
 
 
 VARIANT_CONVERTERS: Callable[[PacketParser], Any] = {
@@ -221,7 +276,9 @@ VARIANT_CONVERTERS: Callable[[PacketParser], Any] = {
     VariantType.String: lambda parser: parser.read_utf8(),
     VariantType.StringList: None,
     VariantType.ByteArray: lambda parser: parser.read_bytes(),
-    VariantType.UserType: None,
+    VariantType.UShort: lambda parser: parser.read_uint(2),
+    VariantType.UChar: lambda parser: parser.read_uint(1),
+    VariantType.UserType: deserialize_usertype,
 }
 
 
@@ -230,14 +287,23 @@ def read_variant(parser: PacketParser):
     type_id = parser.read_uint(4)
     is_null = parser.read_bool()
 
-    type = VariantType(type_id)
+    try:
+        type = VariantType(type_id)
+    except ValueError:
+        return f"invalid type id {type_id}: {bytes(parser.data)}"
+
     converter = VARIANT_CONVERTERS[type]
     if converter is None:
-        return f"missing type handler for {type.name}"
+        return f"missing type handler for {type.name}: {bytes(parser.data)}"
     value = converter(parser)
     if is_null:
         return None
     return value
+
+
+def read_variant_list(parser: PacketParser):
+    list_size = parser.read_uint(4)
+    return [read_variant(parser) for _ in range(list_size)]
 
 
 class CallKind(IntEnum):
@@ -253,57 +319,65 @@ class CallKind(IntEnum):
     CustomCall = 9
 
 
-METHOD_NAMES = {
-    ("LLAccessIpc", 0): "InitiateConnection()",
+METHOD_METADATA = {
+    ("LLAccessIpc", 0): ("InitiateConnection", []),
 
-    ("LLAccessIpc", 2): "NotifyConnectionActive(qulonglong)",    
-    ("LLAccessIpc", 3): "GetSystemInfo()",
-    ("LLAccessIpc", 4): "GetChipsetInfo()",    
-    ("LLAccessIpc", 5): "SMBusGetControllerCount()",
-    ("LLAccessIpc", 6): "SMBusGetCaps(uint64_t)",
-    ("LLAccessIpc", 7): "SMBusGetBlockMaxSize(uint64_t)",
-    ("LLAccessIpc", 8): "SMBusSetDefaultLockTimeout(int)",
-    ("LLAccessIpc", 9): "SMBusSetDefaultOperationTimeout(int)",
-    ("LLAccessIpc", 10): "SMBusSetCPUOffloadMask(uint32_t)",
-    ("LLAccessIpc", 11): "EnumMemoryModules()",
-    ("LLAccessIpc", 12): "SMBusReadByte(ll_access::DramIdentifier,uint16_t,int)",
+    ("LLAccessIpc", 2): ("NotifyConnectionActive", ["qulonglong"]),
+    ("LLAccessIpc", 3): ("GetSystemInfo", []),
+    ("LLAccessIpc", 4): ("GetChipsetInfo", []),
+    ("LLAccessIpc", 5): ("SMBusGetControllerCount", []),
+    ("LLAccessIpc", 6): ("SMBusGetCaps", ["uint64_t"]),
+    ("LLAccessIpc", 7): ("SMBusGetBlockMaxSize", ["uint64_t"]),
+    ("LLAccessIpc", 8): ("SMBusSetDefaultLockTimeout", ["int"]),
+    ("LLAccessIpc", 9): ("SMBusSetDefaultOperationTimeout", ["int"]),
+    ("LLAccessIpc", 10): ("SMBusSetCPUOffloadMask", ["uint32_t"]),
+    ("LLAccessIpc", 11): ("EnumMemoryModules", []),
+    ("LLAccessIpc", 12): ("SMBusReadByte", ["DramIdentifier", "uint16_t", "int"]),
 
-    ("LLAccessIpc", 14): "SMBusWriteByte(ll_access::DramIdentifier,uint16_t,uint8_t,int)",
+    ("LLAccessIpc", 14): ("SMBusWriteByte", ["DramIdentifier", "uint16_t", "uint8_t", "int"]),
 
-    ("LLAccessIpc", 18): "SMBusWriteByteCmdList(ll_access::DramIdentifier,ll_access::CommandList,int)",
+    ("LLAccessIpc", 18): ("SMBusWriteByteCmdList", ["DramIdentifier", "CommandList", "int"]),
 
-    ("LLAccessIpc", 22): "SetPropertyIfRequired(ll_access::DramIdentifier,uint16_t,uint8_t,int)",
-    ("LLAccessIpc", 23): "SMBusLock(uint64_t,int)",
-    ("LLAccessIpc", 24): "SMBusUnlock(uint64_t)",
+    ("LLAccessIpc", 22): ("SetPropertyIfRequired", ["DramIdentifier", "uint16_t", "uint8_t", "int"]),
+    ("LLAccessIpc", 23): ("SMBusLock", ["uint64_t", "int"]),
+    ("LLAccessIpc", 24): ("SMBusUnlock", ["uint64_t"]),
 }
 
 
-"""
-    in >> call;
-    in >> index;
-    const bool success = deserializeQVariantList(in, args);
-    Q_ASSERT(success);
-    Q_UNUSED(success)
-    in >> serialId;
-    in >> propertyIndex;
-"""
+def method_call_repr(object_name, index, arg_values):
+    meta = METHOD_METADATA.get((object_name, index))
+    if meta is not None:
+        method_name, arg_types = meta
+        assert len(arg_types) == len(arg_values), f"metadata mismatch for {method_name}"
+        args_repr = ", ".join(
+            f"/* {arg_type} */ {arg_value}"
+            for arg_value, arg_type
+            in zip(arg_values, arg_types)
+        )
+        return f"{method_name}({args_repr})"
+    args_repr = ", ".join(map(str, arg_values))
+    return f"{index}({args_repr})"
+
+
 def process_invoke_packet(direction, packet_type, parser: PacketParser):
-    name = parser.read_utf16()
+    object_name = parser.read_utf16()
     call_kind_id = parser.read_uint(4)
     index = parser.read_uint(4)
-    # TODO: read variant list
-    # TODO: read serial ID
-    # TODO: read property index
+    args = read_variant_list(parser)
+    parser.skip(-8)
+    serial_id = parser.read_uint(4)
+    property_index = parser.read_int(4)
     call_kind = CallKind(call_kind_id)
-    call_name = METHOD_NAMES.get((name, index), index)
-    print(f"[{direction.name.lower()}] >>> {call_kind.name} {name}::{call_name}")
+    call_repr = method_call_repr(object_name, index, args)
+    print(f"[{direction.name.lower()}] >>> {call_kind.name} {object_name}::{call_repr} -> #{serial_id} prop {property_index}")
 
 
 def process_invoke_reply_packet(direction, packet_type, parser: PacketParser):
-    name = parser.read_utf16()
+    object_name = parser.read_utf16()
     serial_id = parser.read_uint(4)
     value = read_variant(parser)
-    print(f"[{direction.name.lower()}] <<< reply {name}#{serial_id} = {value}")
+    print(f"[{direction.name.lower()}] <<< reply {object_name}#{serial_id} = {value}")
+
 
 PACKET_TYPE_HANDLERS = {
     PacketType.InvokePacket: process_invoke_packet,
