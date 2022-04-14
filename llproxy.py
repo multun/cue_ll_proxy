@@ -344,6 +344,13 @@ METHOD_METADATA = {
 }
 
 
+def get_method_name(object_name, index):
+    meta = METHOD_METADATA.get((object_name, index))
+    if meta is not None:
+        return meta[0]
+    return None
+
+
 def method_call_repr(object_name, index, arg_values):
     meta = METHOD_METADATA.get((object_name, index))
     if meta is not None:
@@ -359,7 +366,7 @@ def method_call_repr(object_name, index, arg_values):
     return f"{index}({args_repr})"
 
 
-def process_invoke_packet(direction, packet_type, parser: PacketParser):
+def process_invoke_packet(options, direction, parser: PacketParser):
     object_name = parser.read_utf16()
     call_kind_id = parser.read_uint(4)
     index = parser.read_uint(4)
@@ -368,11 +375,14 @@ def process_invoke_packet(direction, packet_type, parser: PacketParser):
     serial_id = parser.read_uint(4)
     property_index = parser.read_int(4)
     call_kind = CallKind(call_kind_id)
-    call_repr = method_call_repr(object_name, index, args)
-    print(f"[{direction.name.lower()}] >>> {call_kind.name} {object_name}::{call_repr} -> #{serial_id} prop {property_index}")
+
+    method_name = get_method_name(object_name, index)
+    if not options.filter or method_name in options.filter:
+        call_repr = method_call_repr(object_name, index, args)
+        print(f"[{direction.name.lower()}] >>> {call_kind.name} {object_name}::{call_repr} -> #{serial_id} prop {property_index}")
 
 
-def process_invoke_reply_packet(direction, packet_type, parser: PacketParser):
+def process_invoke_reply_packet(options, direction, parser: PacketParser):
     object_name = parser.read_utf16()
     serial_id = parser.read_uint(4)
     value = read_variant(parser)
@@ -387,9 +397,10 @@ PACKET_TYPE_HANDLERS = {
 
 async def main(args: List[str] = None):
     arg_parser = ArgumentParser(description="Run the CueLLAccess proxy")
-    arg_parser.add_argument('--service-logs', action='store_true', help="Show the logs of the official service")
-    arg_parser.add_argument('--log-packets', action='store_true', help="Show the raw packets")
-    
+    arg_parser.add_argument("--service-logs", action='store_true', help="Show the logs of the official service")
+    arg_parser.add_argument("--log-packets", action='store_true', help="Show the raw packets")
+    arg_parser.add_argument("-f", "--filter", action='append', help="Filter by method name")
+  
     options = arg_parser.parse_args(args=None)
 
     if ctypes.windll.shell32.IsUserAnAdmin() == 0:
@@ -418,7 +429,7 @@ async def main(args: List[str] = None):
         if handler is None:
             print(f"[{direction.name.lower()}] {packet_type.name}")
         else:
-            handler(direction, packet_type, parser)
+            handler(options, direction, parser)
 
     try:
         print("waiting a bit for the service to create the memory mapping")
