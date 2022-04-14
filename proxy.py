@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum, Enum
 from tkinter import Pack
-from typing import Callable, List
+from typing import Callable, List, Any
 
 
 URI_MAPPING_SIZE = 64
@@ -65,7 +65,6 @@ class PacketParser:
         byteorder = self.get_byteorder(byteorder)
         size = self.read_uint(header_size, byteorder=byteorder)
         data = self.read_bytes(size)
-        print("read string data", bytes(data))
 
         if byteorder == "big":
             res = bytearray()
@@ -75,6 +74,12 @@ class PacketParser:
                 res.append(data[i * 2])
             data = res
         return data.decode("utf-16")
+
+    def read_utf8(self, header_size=4, byteorder=None):
+        byteorder = self.get_byteorder(byteorder)
+        size = self.read_uint(header_size, byteorder=byteorder)
+        data = self.read_bytes(size)
+        return data.decode("utf-8")
 
 
 def open_shmem(name, size, writable=False, create=False):
@@ -184,7 +189,7 @@ async def service(*args):
     await proc.wait()
 
 
-# https://github.com/radekp/qt/blob/b881d8fb99972f1bd04ab4c84843cc8d43ddbeed/src/corelib/kernel/qvariant.h#L99
+# https://github.com/qt/qtbase/blob/dev/src/corelib/kernel/qvariant.h
 class VariantType(IntEnum):
     Invalid = 0,
     Bool = 1,
@@ -199,25 +204,78 @@ class VariantType(IntEnum):
     String = 10,
     StringList = 11,
     ByteArray = 12,
-    BitArray = 13,
-    Date = 14,
-    Time = 15,
-    DateTime = 16,
-    Url = 17,
-    Point = 25,
-    PointF = 26,
-    KeySequence = 76,
-    UserType = 127,
+    UserType = 1024,
 
 
-# https://github.com/radekp/qt/blob/b881d8fb99972f1bd04ab4c84843cc8d43ddbeed/src/corelib/kernel/qvariant.cpp#L1966
+VARIANT_CONVERTERS: Callable[[PacketParser], Any] = {
+    VariantType.Invalid: None,
+    VariantType.Bool: lambda parser: parser.read_bool(),
+    VariantType.Int: lambda parser: parser.read_int(4),
+    VariantType.UInt: lambda parser: parser.read_uint(4),
+    VariantType.LongLong: lambda parser: parser.read_int(8),
+    VariantType.ULongLong: lambda parser: parser.read_uint(8),
+    VariantType.Double: None,
+    VariantType.Char: lambda parser: parser.read_bytes(1),
+    VariantType.Map: None,
+    VariantType.List: None,
+    VariantType.String: lambda parser: parser.read_utf8(),
+    VariantType.StringList: None,
+    VariantType.ByteArray: lambda parser: parser.read_bytes(),
+    VariantType.UserType: None,
+}
+
+
+# https://github.com/qt/qtbase/blob/dev/src/corelib/kernel/qvariant.cpp
 def read_variant(parser: PacketParser):
     type_id = parser.read_uint(4)
     is_null = parser.read_bool()
 
     type = VariantType(type_id)
-    # TODO: read the value
-    return (type, is_null)
+    converter = VARIANT_CONVERTERS[type]
+    if converter is None:
+        return f"missing type handler for {type.name}"
+    value = converter(parser)
+    if is_null:
+        return None
+    return value
+
+
+class CallKind(IntEnum):
+    InvokeMetaMethod = 0
+    ReadProperty = 1
+    WriteProperty = 2
+    ResetProperty = 3
+    CreateInstance = 4
+    IndexOfMethod = 5
+    RegisterPropertyMetaType = 6
+    RegisterMethodArgumentMetaType = 7
+    BindableProperty = 8
+    CustomCall = 9
+
+
+METHOD_NAMES = {
+    ("LLAccessIpc", 0): "InitiateConnection()",
+
+    ("LLAccessIpc", 2): "NotifyConnectionActive(qulonglong)",    
+    ("LLAccessIpc", 3): "GetSystemInfo()",
+    ("LLAccessIpc", 4): "GetChipsetInfo()",    
+    ("LLAccessIpc", 5): "SMBusGetControllerCount()",
+    ("LLAccessIpc", 6): "SMBusGetCaps(uint64_t)",
+    ("LLAccessIpc", 7): "SMBusGetBlockMaxSize(uint64_t)",
+    ("LLAccessIpc", 8): "SMBusSetDefaultLockTimeout(int)",
+    ("LLAccessIpc", 9): "SMBusSetDefaultOperationTimeout(int)",
+    ("LLAccessIpc", 10): "SMBusSetCPUOffloadMask(uint32_t)",
+    ("LLAccessIpc", 11): "EnumMemoryModules()",
+    ("LLAccessIpc", 12): "SMBusReadByte(ll_access::DramIdentifier,uint16_t,int)",
+
+    ("LLAccessIpc", 14): "SMBusWriteByte(ll_access::DramIdentifier,uint16_t,uint8_t,int)",
+
+    ("LLAccessIpc", 18): "SMBusWriteByteCmdList(ll_access::DramIdentifier,ll_access::CommandList,int)",
+
+    ("LLAccessIpc", 22): "SetPropertyIfRequired(ll_access::DramIdentifier,uint16_t,uint8_t,int)",
+    ("LLAccessIpc", 23): "SMBusLock(uint64_t,int)",
+    ("LLAccessIpc", 24): "SMBusUnlock(uint64_t)",
+}
 
 
 """
@@ -231,25 +289,21 @@ def read_variant(parser: PacketParser):
 """
 def process_invoke_packet(direction, packet_type, parser: PacketParser):
     name = parser.read_utf16()
-    call = parser.read_uint(4)
+    call_kind_id = parser.read_uint(4)
     index = parser.read_uint(4)
-    print(f"[{direction.name.lower()}] invoke @{name}")
+    # TODO: read variant list
+    # TODO: read serial ID
+    # TODO: read property index
+    call_kind = CallKind(call_kind_id)
+    call_name = METHOD_NAMES.get((name, index), index)
+    print(f"[{direction.name.lower()}] >>> {call_kind.name} {name}::{call_name}")
 
 
-"""
-    m_packet.setId(InvokeReplyPacket);
-    m_packet << name;
-    m_packet << ackedSerialId;
-    m_packet << value;
-    m_packet.finishPacket();
-"""
-# example: b'\x00\x07\x00\x00\x00\x16\x00L\x00L\x00A\x00c\x00c\x00e\x00s\x00s\x00I\x00p\x00c\x00\x00\x00\x10\x00\x00\x00\x01\x00\x00'
-#               type |     name len  |                name                                  |    serial id  |  value qvariant
 def process_invoke_reply_packet(direction, packet_type, parser: PacketParser):
     name = parser.read_utf16()
     serial_id = parser.read_uint(4)
     value = read_variant(parser)
-    print(f"[{direction.name.lower()}] invoke reply @{name} #{serial_id}: {value}")
+    print(f"[{direction.name.lower()}] <<< reply {name}#{serial_id} = {value}")
 
 PACKET_TYPE_HANDLERS = {
     PacketType.InvokePacket: process_invoke_packet,
@@ -257,20 +311,11 @@ PACKET_TYPE_HANDLERS = {
 }
 
 
-def process_packet(direction, packet):
-    print(f"[{direction.name.lower()}] packet {packet}")
-    parser = PacketParser(packet)
-    packet_type = PacketType(parser.read_uint(2))
-    handler = PACKET_TYPE_HANDLERS.get(packet_type)
-    if handler is None:
-        print(f"[{direction.name.lower()}] {packet_type.name}")
-    else:
-        handler(direction, packet_type, parser)
-
-
 async def main(args: List[str] = None):
     arg_parser = ArgumentParser(description="Run the CueLLAccess proxy")
     arg_parser.add_argument('--service-logs', action='store_true', help="Show the logs of the official service")
+    arg_parser.add_argument('--log-packets', action='store_true', help="Show the raw packets")
+    
     options = arg_parser.parse_args(args=None)
 
     if ctypes.windll.shell32.IsUserAnAdmin() == 0:
@@ -289,6 +334,17 @@ async def main(args: List[str] = None):
         stdout=service_io,
         stderr=service_io,
     )
+
+    def process_packet(direction, packet):
+        if options.log_packets:
+            print(f"[{direction.name.lower()}] packet {packet}")
+        parser = PacketParser(packet)
+        packet_type = PacketType(parser.read_uint(2))
+        handler = PACKET_TYPE_HANDLERS.get(packet_type)
+        if handler is None:
+            print(f"[{direction.name.lower()}] {packet_type.name}")
+        else:
+            handler(direction, packet_type, parser)
 
     try:
         print("waiting a bit for the service to create the memory mapping")
