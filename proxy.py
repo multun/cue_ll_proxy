@@ -7,6 +7,7 @@ from argparse import ArgumentParser
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum, Enum
+from tkinter import Pack
 from typing import Callable, List
 
 
@@ -53,6 +54,9 @@ class PacketParser:
         byteorder = self.get_byteorder(byteorder)
         data = self.read_bytes(size)
         return int.from_bytes(data, byteorder=byteorder, signed=signed)
+
+    def read_bool(self):
+        return self.read_bytes(1) != b"\0"
 
     def read_uint(self, size, byteorder=None):
         return self.read_int(size, signed=False, byteorder=byteorder)
@@ -180,13 +184,76 @@ async def service(*args):
     await proc.wait()
 
 
-def process_invoke_packet(direction, packet_type, parser):
-    realm = parser.read_utf16()
-    print(f"[{direction.name.lower()}] invoke @{realm}")
+# https://github.com/radekp/qt/blob/b881d8fb99972f1bd04ab4c84843cc8d43ddbeed/src/corelib/kernel/qvariant.h#L99
+class VariantType(IntEnum):
+    Invalid = 0,
+    Bool = 1,
+    Int = 2,
+    UInt = 3,
+    LongLong = 4,
+    ULongLong = 5,
+    Double = 6,
+    Char = 7,
+    Map = 8,
+    List = 9,
+    String = 10,
+    StringList = 11,
+    ByteArray = 12,
+    BitArray = 13,
+    Date = 14,
+    Time = 15,
+    DateTime = 16,
+    Url = 17,
+    Point = 25,
+    PointF = 26,
+    KeySequence = 76,
+    UserType = 127,
 
+
+# https://github.com/radekp/qt/blob/b881d8fb99972f1bd04ab4c84843cc8d43ddbeed/src/corelib/kernel/qvariant.cpp#L1966
+def read_variant(parser: PacketParser):
+    type_id = parser.read_uint(4)
+    is_null = parser.read_bool()
+
+    type = VariantType(type_id)
+    # TODO: read the value
+    return (type, is_null)
+
+
+"""
+    in >> call;
+    in >> index;
+    const bool success = deserializeQVariantList(in, args);
+    Q_ASSERT(success);
+    Q_UNUSED(success)
+    in >> serialId;
+    in >> propertyIndex;
+"""
+def process_invoke_packet(direction, packet_type, parser: PacketParser):
+    name = parser.read_utf16()
+    call = parser.read_uint(4)
+    index = parser.read_uint(4)
+    print(f"[{direction.name.lower()}] invoke @{name}")
+
+
+"""
+    m_packet.setId(InvokeReplyPacket);
+    m_packet << name;
+    m_packet << ackedSerialId;
+    m_packet << value;
+    m_packet.finishPacket();
+"""
+# example: b'\x00\x07\x00\x00\x00\x16\x00L\x00L\x00A\x00c\x00c\x00e\x00s\x00s\x00I\x00p\x00c\x00\x00\x00\x10\x00\x00\x00\x01\x00\x00'
+#               type |     name len  |                name                                  |    serial id  |  value qvariant
+def process_invoke_reply_packet(direction, packet_type, parser: PacketParser):
+    name = parser.read_utf16()
+    serial_id = parser.read_uint(4)
+    value = read_variant(parser)
+    print(f"[{direction.name.lower()}] invoke reply @{name} #{serial_id}: {value}")
 
 PACKET_TYPE_HANDLERS = {
     PacketType.InvokePacket: process_invoke_packet,
+    PacketType.InvokeReplyPacket: process_invoke_reply_packet,
 }
 
 
