@@ -1,10 +1,11 @@
 import os
+import sys
 import _winapi
 import ctypes
 import asyncio
 import subprocess
 from argparse import ArgumentParser
-from contextlib import contextmanager
+from contextlib import contextmanager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from enum import IntEnum, Enum
 from typing import Callable, List, Any
@@ -44,6 +45,33 @@ ll_access::DramIdentifier\x00 # custom type name
 \x00\x00\x00\x0b # packet serial id
 \xff\xff\xff\xff # packet property index
 """
+
+"""
+example LLAccessIpc::EnumMemoryModules response
+
+# packet type
+\x00\x07
+# object name
+\x00\x00\x00\x16
+\x00L\x00L\x00A\x00c\x00c\x00e\x00s\x00s\x00I\x00p\x00c
+# serial id
+\x00\x00\x00\x07
+# variant
+\x00\x00\x04\x00 # user type
+\x00 # is null
+# type name
+\x00\x00\x00\x18
+QVector<LLMemoryModule>\x00
+# vector length
+\x00\x00\x00\x02
+# first module
+\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00\x00R\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00\x00\x9e\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x00\x00\n\x00\x00\x00\x00$\x00C\x00M\x00U\x001\x006\x00G\x00X\x004\x00M\x002\x00A\x002\x006\x006\x006\x00C\x001\x006\x00\x00\x04\x00\x00\x00\x00\x00\x1fLLMemoryTypeEnum::LLMemoryType\x00\x02\x00\x00\x04\x00\x00\x00\x00\x00\x1fLLModuleTypeEnum::LLModuleType\x00\x02\x00\x00\x00\x02\x00\x00\x00 \x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x055\x00\x00\x00\x02\x00\x00\x00\nj\x00\x00\x00\x02\x00\x00\x00\x08U
+                                                                       X                                X
+# second module
+\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x03\x00\x00\x00\x02\x00\x00\x00\x00S\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00\x00\x9e\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x00\x00\n\x00\x00\x00\x00$\x00C\x00M\x00U\x001\x006\x00G\x00X\x004\x00M\x002\x00A\x002\x006\x006\x006\x00C\x001\x006\x00\x00\x04\x00\x00\x00\x00\x00\x1fLLMemoryTypeEnum::LLMemoryType\x00\x02\x00\x00\x04\x00\x00\x00\x00\x00\x1fLLModuleTypeEnum::LLModuleType\x00\x02\x00\x00\x00\x02\x00\x00\x00 \x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x055\x00\x00\x00\x02\x00\x00\x00\nj\x00\x00\x00\x02\x00\x00\x00\x08U
+
+"""
+
 
 
 URI_MAPPING_SIZE = 64
@@ -184,13 +212,18 @@ class LLProxy:
     target_port: int
     packet_callback: Callable[[PacketDirection, bytes], None]
 
-
+    @asynccontextmanager
     @staticmethod
     async def create(target_host: str, target_port: int, packet_callback) -> "LLProxy":
-        proxy = LLProxy(None, target_host, target_port, packet_callback)
-        server = await asyncio.start_server(proxy.handle_client, '127.0.0.1', 0)
-        proxy.server = server
-        return proxy
+        try:
+            proxy = LLProxy(None, target_host, target_port, packet_callback)
+            server = await asyncio.start_server(proxy.handle_client, '127.0.0.1', 0)
+            proxy.server = server
+            yield proxy
+        finally:
+            proxy.server.close()
+            await proxy.server.wait_closed()
+
 
     @property
     def proxy_port(self):
@@ -216,6 +249,8 @@ class LLProxy:
             pipe1 = self.packet_pipe(PacketDirection.INBOUND, local_reader, remote_writer)
             pipe2 = self.packet_pipe(PacketDirection.OUTBOUND, remote_reader, local_writer)
             await asyncio.gather(pipe1, pipe2)
+        except ConnectionResetError:
+            print("connection reset")
         finally:
             local_writer.close()
             remote_writer.close()
@@ -322,6 +357,8 @@ class CallKind(IntEnum):
 METHOD_METADATA = {
     ("LLAccessIpc", 0): ("InitiateConnection", []),
 
+    ("LLAccessIpc", 1): ("CloseConnection", ["quint64"]),  # untested
+
     ("LLAccessIpc", 2): ("NotifyConnectionActive", ["qulonglong"]),
     ("LLAccessIpc", 3): ("GetSystemInfo", []),
     ("LLAccessIpc", 4): ("GetChipsetInfo", []),
@@ -334,9 +371,17 @@ METHOD_METADATA = {
     ("LLAccessIpc", 11): ("EnumMemoryModules", []),
     ("LLAccessIpc", 12): ("SMBusReadByte", ["DramIdentifier", "uint16_t", "int"]),
 
+    ("LLAccessIpc", 13): ("SMBusReadBlock", ["DramIdentifier", "uint16_t", "int", "int", "int"]), # untested
     ("LLAccessIpc", 14): ("SMBusWriteByte", ["DramIdentifier", "uint16_t", "uint8_t", "int"]),
+    ("LLAccessIpc", 15): ("SMBusWriteWord", ["DramIdentifier", "uint16_t", "uint16_t", "int"]), # untested
+    ("LLAccessIpc", 16): ("SMBusWriteBlock", ["DramIdentifier", "uint16_t", "uint8_t", "Bytes", "int", "int"]), # untested
+    ("LLAccessIpc", 17): ("SMBusWriteBlockNative", ["DramIdentifier", "uint16_t", "Bytes", "int", "int"]), # untested
 
     ("LLAccessIpc", 18): ("SMBusWriteByteCmdList", ["DramIdentifier", "CommandList", "int"]),
+
+    ("LLAccessIpc", 19): ("SMBusWriteWordCmdList", ["DramIdentifier", "WordCommandList", "int"]), # untested
+    ("LLAccessIpc", 20): ("SMBusWriteBlockCmdList", ["DramIdentifier", "BlockCommandList", "int"]), # untested
+    ("LLAccessIpc", 21): ("GetTSODReadings", ["uint64_t", "uint8_t", "int"]), # untested
 
     ("LLAccessIpc", 22): ("SetPropertyIfRequired", ["DramIdentifier", "uint16_t", "uint8_t", "int"]),
     ("LLAccessIpc", 23): ("SMBusLock", ["uint64_t", "int"]),
@@ -395,21 +440,19 @@ PACKET_TYPE_HANDLERS = {
 }
 
 
-async def main(args: List[str] = None):
-    arg_parser = ArgumentParser(description="Run the CueLLAccess proxy")
-    arg_parser.add_argument("--service-logs", action='store_true', help="Show the logs of the official service")
-    arg_parser.add_argument("--log-packets", action='store_true', help="Show the raw packets")
-    arg_parser.add_argument("-f", "--filter", action='append', help="Filter by method name")
-  
-    options = arg_parser.parse_args(args=None)
-
-    if ctypes.windll.shell32.IsUserAnAdmin() == 0:
-        print("please run this script as administrator")
-        exit(1)
-
+@asynccontextmanager
+async def pause_windows_service():
     print("stopping the managed service")
     await service("stop", "CorsairLLAService")
+    try:
+        yield None
+    finally:
+        print("restarting the managed service")
+        await service("start", "CorsairLLAService")
 
+
+@asynccontextmanager
+async def run_access_service(options):
     print("running the service manually")
     service_env = {**os.environ, "QT_LOGGING_RULES": "*=true"}
     service_io = (None if options.service_logs else subprocess.DEVNULL)
@@ -419,6 +462,46 @@ async def main(args: List[str] = None):
         stdout=service_io,
         stderr=service_io,
     )
+
+    print("waiting a bit for the service to create the memory mapping")
+    await asyncio.sleep(3)
+
+    try:
+        yield None
+    finally:
+        service_proc.terminate()
+        await service_proc.wait()
+
+
+@asynccontextmanager
+async def run_proxy(process_packet):
+    try:
+        shmem = open_shmem(URI_MAPPING_NAME, URI_MAPPING_SIZE, writable=True)
+    except FileNotFoundError:
+        print("could not create the shared memory mapping")
+        print("please start CueLLAccessService")
+        sys.exit(1)
+
+    original_port = decode_shmem_port(shmem)
+    async with LLProxy.create("127.0.0.1", original_port, process_packet) as proxy:
+        print(f"original port: {original_port}")
+        print(f"proxy port: {proxy.proxy_port}")
+
+        with patch_shmem(shmem, encode_shmem_port(proxy.proxy_port)):
+            yield proxy
+
+
+async def main(args: List[str] = None):
+    arg_parser = ArgumentParser(description="Run the CueLLAccess proxy")
+    arg_parser.add_argument("--service-logs", action='store_true', help="Show the logs of the official service")
+    arg_parser.add_argument("--log-packets", action='store_true', help="Show the raw packets")
+    arg_parser.add_argument("-f", "--filter", action='append', help="Filter by method name")
+
+    options = arg_parser.parse_args(args=None)
+
+    if ctypes.windll.shell32.IsUserAnAdmin() == 0:
+        print("please run this script as administrator")
+        sys.exit(1)
 
     def process_packet(direction, packet):
         if options.log_packets:
@@ -431,37 +514,12 @@ async def main(args: List[str] = None):
         else:
             handler(options, direction, parser)
 
-    try:
-        print("waiting a bit for the service to create the memory mapping")
-        await asyncio.sleep(3)
-
-        try:
-            shmem = open_shmem(URI_MAPPING_NAME, URI_MAPPING_SIZE, writable=True)
-        except FileNotFoundError:
-            print("could not create the shared memory mapping")
-            print("please start CueLLAccessService")
-            exit(1)
-
-        original_port = decode_shmem_port(shmem)
-        proxy = await LLProxy.create("127.0.0.1", original_port, process_packet)
-
-        print(f"original port: {original_port}")
-        print(f"proxy port: {proxy.proxy_port}")
-
-        with patch_shmem(shmem, encode_shmem_port(proxy.proxy_port)):
-            try:
-                while True:
-                    await asyncio.sleep(42)
-            finally:
-                proxy.server.close()
-                await proxy.server.wait_closed()
-    finally:
-        print("stopping the manually started service")
-        service_proc.terminate()
-        await service_proc.wait()
-        print("restarting the managed service")
-        await service("start", "CorsairLLAService")
-
+    async with AsyncExitStack() as exit_stack:
+        await exit_stack.enter_async_context(pause_windows_service())
+        await exit_stack.enter_async_context(run_access_service(options))
+        proxy = await exit_stack.enter_async_context(run_proxy(process_packet))
+        while True:
+            await asyncio.sleep(42)
 
 
 if __name__ == "__main__":
